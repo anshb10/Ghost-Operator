@@ -75,7 +75,8 @@ def rank_candidates(results: list[dict], known_vendors: list[dict], limit: int =
 async def discover(req: Requirements, known_vendors: list[dict], mode: str) -> dict:
     query = build_query(req)
     try:
-        data = await tinyfish.search(query, req.domain, mode, exclude_domains=EXCLUDE_PARAM)
+        data = await tinyfish.search(query, req.domain, mode, location="IN" if req.currency == "INR" else "US",
+                                     exclude_domains=EXCLUDE_PARAM)
     except Exception as e:  # discovery is additive; never block planning on it
         return {"query": query, "vendors": [], "error": str(e)[:200], "n_results": 0}
     results = data.get("results", [])

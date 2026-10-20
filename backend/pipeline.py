@@ -1,37 +1,48 @@
-"""Mission orchestration: plan -> parallel TinyFish agents -> ML analysis -> recommendation -> human approval."""
+"""Mission orchestration: plan -> parallel TinyFish agents -> verification -> analysis -> recommendation -> human approval.
+
+Stages and who owns them:
+  sourcing agents     TinyFish Web Agents, one per vendor (this file)
+  verification agent  TinyFish Fetch + claims ledger + adversarial checks (verify.py, evidence.py, adversarial.py)
+  ML                  entity resolution and fair-price model (ml/)
+  cost / risk / decision  engine.analyze → landed_cost.py, risk.py, decision.py
+  memo                Claude (optional) explains the decision; grounding.py rejects figures it didn't get from us
+Every stage appends to the mission's hash-chained audit log (audit.py).
+"""
 import asyncio
 import json
-import re
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timezone
 
-from . import config, planner, tinyfish, verify
-from .ml import matching, normalize, pricing, warranty_risk
+from . import audit, config, grounding, memory, planner, tinyfish, verify
+from .engine import analyze, roles_summary
+from .exports import money
+from .ml import matching, normalize, pricing
 from .models import Offer, Requirements
-from .scoring import apply_constraints, compute_tco, rank
 
 log = logging.getLogger("ghost.pipeline")
 PRODUCTS_PER_VENDOR = 4
 
 
 class Mission:
-    def __init__(self, req: Requirements, vendors: list[dict], objective: str, planner_used: str):
+    def __init__(self, req: Requirements, vendors: list[dict], objective: str, planner_used: str, mode: str | None = None):
         self.id = uuid.uuid4().hex[:8]
         self.created = datetime.now(timezone.utc).isoformat()
         self.objective = objective
         self.req = req
         self.vendors = vendors
         self.planner_used = planner_used
-        self.mode = config.effective_mode()
+        self.mode = mode or config.effective_mode()
         self.status = "browsing"
         self.agents = {v["key"]: {"vendor": v["name"], "url": v["url"], "status": "queued", "steps": [],
-                                  "stream_url": None, "run_id": None, "n_offers": 0, "error": None}
+                                  "stream_url": None, "run_id": None, "n_offers": 0, "error": None, "provenance": None}
                        for v in vendors}
         self.offers: list[Offer] = []
         self.report: dict | None = None
         self.decision: dict | None = None
+        self.audit: list[dict] = []
         self.events: list[dict] = []
         self._cond = asyncio.Condition()
 
@@ -48,15 +59,22 @@ class Mission:
             except asyncio.TimeoutError:
                 return False
 
+    def log(self, actor: str, action: str, **data) -> None:
+        audit.append(self.audit, actor, action, data)
+
     def snapshot(self) -> dict:
         return {"id": self.id, "objective": self.objective, "created": self.created, "mode": self.mode,
                 "status": self.status, "planner": self.planner_used, "requirements": self.req.model_dump(),
                 "agents": self.agents, "report": self.report, "decision": self.decision}
 
-
     def save(self) -> None:
         MISSIONS_DIR.mkdir(parents=True, exist_ok=True)
-        (MISSIONS_DIR / f"{self.id}.json").write_text(json.dumps({**self.snapshot(), "vendors": self.vendors}))
+        snap = self.snapshot()
+        (MISSIONS_DIR / f"{self.id}.json").write_text(json.dumps({**snap, "vendors": self.vendors, "audit": self.audit}))
+        try:
+            memory.record_mission(snap)
+        except Exception as e:  # memory is an index over the mission files; never lose a mission because of it
+            log.warning("memory write failed for %s: %s", self.id, e)
 
     @classmethod
     def load(cls, mid: str) -> "Mission | None":
@@ -64,14 +82,15 @@ class Mission:
         if not mid.isalnum() or not path.exists():
             return None
         d = json.loads(path.read_text())
-        m = cls(Requirements(**d["requirements"]), d["vendors"], d["objective"], d["planner"])
-        m.id, m.created, m.mode, m.status = d["id"], d["created"], d["mode"], d["status"]
+        m = cls(Requirements(**d["requirements"]), d["vendors"], d["objective"], d["planner"], d["mode"])
+        m.id, m.created, m.status = d["id"], d["created"], d["status"]
         m.agents, m.report, m.decision = d["agents"], d["report"], d["decision"]
+        m.audit = d.get("audit", [])
         m.events = [{"seq": 0, "kind": "report", "t": time.time(), "status": m.status}] if m.report else []
         return m
 
 
-MISSIONS_DIR = config.ROOT / "data" / "missions"
+MISSIONS_DIR = config.DATA_DIR / "missions"
 MISSIONS: dict[str, Mission] = {}
 
 
@@ -105,12 +124,18 @@ async def _run_agent(m: Mission, v: dict, domain_cfg: dict, sem: asyncio.Semapho
                     await m.emit("agent_step", vendor=v["key"], message=ev["message"])
                 elif ev["type"] == "complete":
                     offers = normalize.normalize_offers(v["name"], ev["result"], domain_cfg)
-                    a.update(status="done", n_offers=len(offers))
+                    source = f"TinyFish run {a['run_id']} at {datetime.now(timezone.utc).isoformat(timespec='seconds')}"
+                    prov = ev.get("provenance") or tinyfish.provenance(source, live=True)
+                    for o in offers:
+                        o.provenance = prov
+                    a.update(status="done", n_offers=len(offers), provenance=prov)
                     if m.mode == "live":
-                        tinyfish.record(m.req.domain, v["key"], steps, ev["result"], started,
-                                        f"TinyFish run {a['run_id']} at {datetime.now(timezone.utc).isoformat()}")
+                        tinyfish.record(m.req.domain, v["key"], steps, ev["result"], started, source)
+                    m.log(f"sourcing-agent:{v['key']}", "sourcing.completed", vendor=v["name"], url=v["url"],
+                          offers=len(offers), steps=len(steps), provenance=prov,
+                          extracted=[{"id": o.id, "name": o.name, "unit_price": o.unit_price, "url": o.url} for o in offers])
                     await m.emit("agent", vendor=v["key"], status="done", n_offers=len(offers),
-                                 seconds=round(time.time() - started))
+                                 seconds=round(time.time() - started), provenance=prov["kind"])
                     return offers
                 elif ev["type"] == "error":
                     raise RuntimeError(ev["message"])
@@ -118,68 +143,76 @@ async def _run_agent(m: Mission, v: dict, domain_cfg: dict, sem: asyncio.Semapho
         except Exception as e:
             log.warning("agent %s failed: %s", v["key"], e)
             a.update(status="failed", error=str(e)[:300])
+            m.log(f"sourcing-agent:{v['key']}", "sourcing.failed", vendor=v["name"], error=a["error"])
             await m.emit("agent", vendor=v["key"], status="failed", error=a["error"])
             return []
 
 
 def pick_recommendation(ranked: list[Offer]) -> tuple[Offer | None, Offer | None]:
-    """Recommend the best offer whose price was confirmed on the vendor's own page (Fetch API).
-    If a higher-scoring offer couldn't be confirmed, return it as the 'value pick' to request a quote for."""
-    eligible = [o for o in ranked if o.rank]
-    if not eligible:
-        return None, None
-    unavailable = lambda o: bool(re.search(r"(?i)backorder|sold out|out of stock|unavailable", o.stock or ""))
-    confirmed = [o for o in eligible if o.verification.get("status") == "verified" and not unavailable(o)]
-    best = confirmed[0] if confirmed else eligible[0]
-    value = eligible[0] if eligible[0] is not best else None
-    return best, value
+    """Kept for callers of the old API: (recommended, value pick) under the evidence policy in decision.py."""
+    from .decision import decide
+    d = decide(ranked)
+    by_id = {o.id: o for o in ranked}
+    return by_id.get(d["recommended_offer_id"]), by_id.get(d["value_pick_id"])
 
 
-def _template_summary(req: Requirements, ranked: list[Offer], best: Offer | None, value: Offer | None) -> str:
+def _money(v: float | None, cur: str) -> str:
+    return money(v, cur, 0)
+
+
+def _template_summary(req: Requirements, ranked: list[Offer], decision: dict) -> str:
+    by_id = {o.id: o for o in ranked}
+    best, value = by_id.get(decision["recommended_offer_id"]), by_id.get(decision["value_pick_id"])
+    cur = req.currency
     ok = [o for o in ranked if o.rank]
     if not ok:
         from collections import Counter
-        reasons = Counter("unit price over budget" if f.startswith("unit price") else f.split(" (")[0]
+        reasons = Counter("landed total over budget" if f.startswith("landed total") else
+                          "unit price over budget" if f.startswith("unit price") else
+                          "can't meet the deadline" if f.startswith("delivery") else f.split(" (")[0]
                           for o in ranked for f in o.failed_constraints if not f.startswith("unverified"))
         why = "; ".join(f"{r} ({n} offers)" for r, n in reasons.most_common(2))
         return (f"No option met every must-have requirement. Most common blockers: {why or 'missing prices'}. "
                 "Loosening that constraint or adding vendors may surface a viable choice.")
-    unit = best.effective_unit_price or best.unit_price
-    vs = best.verification.get("status")
-    s = (f"Recommend {req.quantity} × {best.name} from {best.vendor} at ${unit:,.0f}/unit "
-         f"(${unit * req.quantity:,.0f} purchase, ${best.tco:,.0f} estimated {req.quantity}-unit lifetime cost). ")
-    if vs == "verified":
-        s += "Price and specs were re-checked on the product page. "
-    elif vs == "partial":
-        s += "Specs were re-checked on the product page; confirm the price with a quote. "
+    lc = best.landed or {}
+    total = lc.get("total")
+    s = (f"{'Provisionally recommend' if decision['provisional'] else 'Recommend'} {req.quantity} × {best.name} from "
+         f"{best.vendor}: landed total {_money(total, cur)} ({_money(lc.get('per_unit'), cur)}/unit, {lc.get('confidence', 'n/a')}"
+         + (f"; not stated: {', '.join(lc['unknowns'])}" if lc.get("unknowns") else "") + "). ")
+    if req.budget_total and total is not None:
+        s += f"That is {_money(abs(req.budget_total - total), cur)} {'under' if total <= req.budget_total else 'over'} budget. "
+    if best.verification.get("status") == "verified":
+        s += "Price and specs were re-checked on the vendor's product page. "
     if value:
-        vu = value.effective_unit_price or value.unit_price
-        why = (f"its ${value.unit_price:,.0f} promo is capped at {value.verification['limit']['max_units']} units per order "
-               f"(expected average ≈${vu:,.0f})" if value.verification.get("limit") and value.effective_unit_price
-               else f"it is listed as {re.sub(r'(?i)^item ', '', value.stock).lower()}" if re.search(r"(?i)backorder|sold out", value.stock or "")
-               else f"its price for {req.quantity} units couldn't be confirmed on the vendor's page")
-        s += (f"{value.vendor}'s {value.name.split(' (')[0]} scores higher on paper, but {why}; "
-              f"request a written quote before switching. ")
+        from .decision import blockers
+        s += (f"{value.vendor}'s {value.name.split(' (')[0]} scores higher ({value.score:.0f} vs {best.score:.0f}), but "
+              f"{'; '.join(blockers(value))}; request a written quote before switching. ")
     runner = next((o for o in ok if o is not best and o is not value), None)
     if runner:
-        r = runner
-        s += (f"The runner-up is {r.name} from {r.vendor} at ${(r.effective_unit_price or r.unit_price):,.0f}/unit, "
-              f"scoring {r.score:.0f} vs {best.score:.0f}"
-              + (f", but it is {r.stock.lower()}. " if re.search(r"(?i)backorder|sold out", r.stock or "") else ". "))
-    trapped = [o for o in ranked if o.verification.get("limit") and o.effective_unit_price and o is not value]
+        s += (f"The runner-up is {runner.vendor}'s {runner.name.split(' (')[0]} at "
+              f"{_money((runner.landed or {}).get('total'), cur)} landed, scoring {runner.score:.0f} vs {best.score:.0f}"
+              + (f", but it is {re.sub(r'(?i)^item ', '', runner.stock).lower()}. "
+                 if re.search(r"(?i)backorder|sold out", runner.stock or "") else ". "))
+    trapped = [o for o in ranked if any(f["code"] == "BULK_CAP" for f in o.flags) and o is not value and o.effective_unit_price]
     if trapped:
         t = min(trapped, key=lambda o: o.unit_price)
         where = "a listing of the same model caps" if t.verification["limit"].get("inferred_from") else "its product page caps"
-        s += (f"Note: {t.vendor}'s ${t.unit_price:,.0f} {t.name.split(' (')[0]} looks cheapest, but {where} that "
+        s += (f"Note: {t.vendor}'s {_money(t.unit_price, cur)} {t.name.split(' (')[0]} looks cheapest, but {where} that "
               f"promo at {t.verification['limit']['max_units']} units per order, so the expected average is "
-              f"${t.effective_unit_price:,.0f}. ")
-    if best.warranty_risk_reasons:
+              f"{_money(t.effective_unit_price, cur)}. ")
+    bad = [f for f in best.flags if f["severity"] in ("high", "medium")]
+    if bad:
+        s += f"Open finding on the pick: {bad[0]['title'].lower()}. "
+    elif best.warranty_risk_reasons:
         s += f"Main risk: {best.warranty_risk_reasons[0][0].lower() + best.warranty_risk_reasons[0][1:]}. "
-        if req.domain == "laptops" and (best.warranty.service != "onsite" or (best.warranty.years or 0) < 3):
-            s += "Ask the vendor to quote a warranty extension or onsite upgrade before approving. "
-    if best.anomaly:
-        s += f"Pricing note: {best.anomaly}. "
+    if req.domain.startswith("laptops") and (best.warranty.service != "onsite" or (best.warranty.years or 0) < 3):
+        s += "Ask the vendor to quote a warranty extension or onsite upgrade before approving. "
     return s.strip()
+
+
+def _compact_flags(offers: list[Offer]) -> list[dict]:
+    return [{"offer_id": o.id, "vendor": o.vendor, "code": f["code"], "severity": f["severity"], "title": f["title"]}
+            for o in offers for f in o.flags if f["severity"] in ("high", "medium")]
 
 
 async def run_mission(m: Mission) -> None:
@@ -195,9 +228,17 @@ async def run_mission(m: Mission) -> None:
                      f"{sum(1 for r in results if r)} vendors into canonical specs")
 
         vsum = await verify.verify_offers(offers, m.req.domain, m.mode, m.req.quantity)
+        cl = vsum.get("claims", {})
         await m.emit("verify", step="verify", message=f"TinyFish Fetch API re-read {vsum['pages_fetched']} product pages: "
                      f"{vsum['verified']} verified, {vsum['partial']} partly verified, {vsum['mismatch']} mismatched, {vsum['unverified']} unverifiable, "
                      f"{vsum['corrections']} correction(s) applied", summary=vsum)
+        m.log("verification-agent", "verification.completed", summary=vsum,
+              contradicted=[{"offer_id": o.id, "field": c["field"], "claimed": c["claimed"], "observed": c["observed"],
+                             "source_url": c["source_url"], "snippet": c["snippet"]}
+                            for o in offers for c in o.claims if c["status"] == "contradicted"])
+        await m.emit("ml", step="claims", message=f"Claims ledger: {cl.get('verified', 0)} verified, "
+                     f"{cl.get('contradicted', 0)} contradicted, {cl.get('inferred', 0)} inferred, {cl.get('unknown', 0)} unknown; "
+                     f"{vsum.get('flags', 0)} adversarial finding(s)")
 
         groups = matching.group_offers(offers)
         await m.emit("ml", step="match", message=f"Entity resolution (TF-IDF char n-grams + spec agreement): "
@@ -207,50 +248,74 @@ async def run_mission(m: Mission) -> None:
         n_anom = sum(1 for o in offers if o.anomaly)
         await m.emit("ml", step="price", message=f"Fair-price model ({price_info['method']}): {n_anom} anomaly flag(s)")
 
-        target_years = next((float(c.value) for c in m.req.constraints if c.attribute == "warranty_years"),
-                            domain_cfg["risk_model"]["lifetime_years"])
-        for o in offers:
-            warranty_risk.score_offer(o, target_years)
-        await m.emit("ml", step="risk", message="Warranty risk: clause classifier (TF-IDF + logistic regression) "
-                     "+ structured features (term, service type, condition, seller)")
-
-        apply_constraints(offers, m.req)
-        compute_tco(offers, m.req, domain_cfg["risk_model"])
-        ranked = rank(offers)
+        result = analyze(offers, m.req, domain_cfg)
+        ranked, decision = result["ranked"], result["decision"]
+        await m.emit("ml", step="risk", message="Landed cost + supplier risk radar (evidence, spec, delivery, warranty, "
+                     "price transparency, integrity)")
+        m.log("cost-analyst", "cost.landed", currency=m.req.currency,
+              offers=[{"offer_id": o.id, "total": o.landed.get("total"), "confidence": o.landed.get("confidence"),
+                       "unknowns": o.landed.get("unknowns")} for o in ranked if o.landed])
+        m.log("risk-analyst", "risk.assessed", findings=_compact_flags(ranked),
+              radar=[{"offer_id": o.id, "overall": o.risk.get("overall"), "level": o.risk.get("level")} for o in ranked])
         m.offers = ranked
         n_ok = sum(1 for o in ranked if o.rank)
-        await m.emit("ml", step="rank", message=f"Ranked {n_ok} eligible offers by fit, TCO, risk and price sanity; "
-                     f"{len(ranked) - n_ok} excluded")
+        await m.emit("ml", step="rank", message=f"Ranked {n_ok} eligible offers by fit, lifetime cost, supplier risk, "
+                     f"price sanity and source trust; {len(ranked) - n_ok} excluded")
+        from .scoring import WEIGHTS
+        m.log("ranking", "ranking.completed", weights=WEIGHTS,
+              ranking=[{"offer_id": o.id, "rank": o.rank, "score": o.score, "parts": o.score_parts,
+                        "failed": o.failed_constraints} for o in ranked])
+        m.log("decision-agent", "decision.recommended", policy=decision["policy"], trace=decision["trace"],
+              why=decision["why"], recommended_offer_id=decision["recommended_offer_id"],
+              value_pick_id=decision["value_pick_id"], provisional=decision["provisional"])
 
         deltas = pricing.cross_vendor_deltas(ranked)
         families = matching.family_matches(ranked)
         insights = {"cross_vendor": deltas, "families": families, "price_model": price_info, "groups": groups,
                     "verification": vsum}
-        best, value = pick_recommendation(ranked)
-        top = [{k: v for k, v in o.model_dump().items() if k not in ("evidence",)} for o in ranked[:4]]
-        top.insert(0, {"recommended_offer_id": best.id if best else None, "value_pick_needing_quote": value.id if value else None,
-                       "rule": "recommend the best offer whose price was confirmed on the vendor page"})
+        best = next((o for o in ranked if o.id == decision["recommended_offer_id"]), None)
+        offers_out = [o.model_dump() for o in ranked]
+        top = [{k: v for k, v in o.items() if k not in ("evidence", "claims", "risk", "history")} for o in offers_out[:4]]
+        top.insert(0, {"recommended_offer_id": decision["recommended_offer_id"], "why": decision["why"],
+                       "value_pick_needing_quote": decision["value_pick_id"], "policy": decision["policy"]})
+        memo_check = None
         try:
             summary = await asyncio.to_thread(planner.summarize_with_claude, m.req, top,
-                                            {"cross_vendor": deltas, "families": families[:3]})
+                                              {"cross_vendor": deltas, "families": families[:3]})
+            memo_check = grounding.check_memo(summary, grounding.allowed_figures(offers_out, m.req))
+            if not memo_check["ok"]:
+                raise RuntimeError(f"memo cites figures not produced by the cost engine: {memo_check['unsupported']}")
             summary_by = "claude"
         except Exception as e:
             log.info("summary fallback: %s", e)
-            summary, summary_by = _template_summary(m.req, ranked, best, value), "template"
+            summary, summary_by = _template_summary(m.req, ranked, decision), "template"
+        m.log("memo", "memo.drafted", by=summary_by, grounding=memo_check)
 
+        landed_best = (best.landed or {}).get("total") if best else None
         m.report = {
-            "summary": summary, "summary_by": summary_by,
-            "recommended_offer_id": best.id if best else None,
-            "value_pick_id": value.id if value else None,
-            "offers": [o.model_dump() for o in ranked],
+            "summary": summary, "summary_by": summary_by, "memo_check": memo_check,
+            "recommended_offer_id": decision["recommended_offer_id"],
+            "value_pick_id": decision["value_pick_id"],
+            "decision": decision,
+            "roles": roles_summary(m.agents, vsum, ranked, decision),
+            "currency": m.req.currency,
+            "provenance": sorted({(o.provenance or {}).get("kind", "unknown") for o in ranked}),
+            "offers": offers_out,
             "insights": insights,
-            "budget_ok": ((best.effective_unit_price or best.unit_price) * m.req.quantity <= m.req.budget_total_usd)
-            if best and m.req.budget_total_usd else None,
+            "budget_ok": (landed_best <= m.req.budget_total) if landed_best is not None and m.req.budget_total else None,
         }
+        try:
+            hist = memory.history_for(m.snapshot(), m.report["offers"])
+            for o in m.report["offers"]:
+                o["history"] = hist.get(o["id"], {})
+        except Exception as e:
+            log.warning("history lookup failed: %s", e)
         m.status = "awaiting_approval"
         m.save()
         await m.emit("report", status=m.status)
     except Exception as e:
         log.exception("mission failed")
         m.status = "failed"
+        m.log("system", "mission.failed", error=str(e)[:500])
+        m.save()
         await m.emit("status", status="failed", error=str(e))

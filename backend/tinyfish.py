@@ -10,7 +10,9 @@ Web Agent: run_live / run_replay yield the same normalized events:
 import asyncio
 import json
 import logging
+import re
 import time
+from datetime import datetime, timezone
 from typing import AsyncIterator
 
 import httpx
@@ -18,6 +20,20 @@ import httpx
 from . import config
 
 log = logging.getLogger("ghost.tinyfish")
+
+
+def provenance(source: str, live: bool = False) -> dict:
+    """Label a recording honestly: real TinyFish data (live now, or recorded earlier) vs hand-written test fixtures."""
+    if live:
+        return {"kind": "live", "source": source}
+    kind = "synthetic" if re.search(r"(?i)synthetic|fictional", source or "") else "recorded"
+    return {"kind": kind, "source": source or "recording (source not stated)"}
+
+
+def recorded_date(source: str) -> str | None:
+    """'Real TinyFish run … on 2026-10-16 (…)' -> '2026-10-16'. Recordings without a date stay undated."""
+    m = re.search(r"\d{4}-\d{2}-\d{2}", source or "")
+    return m.group(0) if m else None
 
 
 def _maybe_json(v):
@@ -97,7 +113,7 @@ async def run_replay(domain: str, vendor_key: str) -> AsyncIterator[dict]:
     if rec.get("error"):
         yield {"type": "error", "message": rec["error"]}
     else:
-        yield {"type": "complete", "result": rec.get("result", {})}
+        yield {"type": "complete", "result": rec.get("result", {}), "provenance": provenance(rec.get("_source", ""))}
 
 
 def record(domain: str, vendor_key: str, steps: list[str], result, started: float, source: str) -> None:
@@ -137,14 +153,19 @@ async def search(query: str, domain: str, mode: str, location: str = "US", exclu
 # ── Fetch API: read product pages to verify what the agents extracted ────────
 
 async def fetch_pages(urls: list[str], domain: str, mode: str) -> dict[str, dict]:
-    """POST api.fetch.tinyfish.ai (≤10 URLs per call) → {url: {"title", "text"}}; failures are omitted."""
+    """POST api.fetch.tinyfish.ai (≤10 URLs per call) → {url: {"title", "text", "fetched_at", "provenance"}};
+    failures are omitted. fetched_at is when the page text was actually retrieved (the recording date in replay)."""
     urls = list(dict.fromkeys(u for u in urls if u.startswith("http")))
     if mode != "live":
         pages = {}
         for base in (config.REPLAY_DIR, config.RECORD_DIR):  # curated fixtures, then anything recorded live
             path = base / domain / "_fetch.json"
             if path.exists():
-                pages.update(json.loads(path.read_text())["pages"])
+                data = json.loads(path.read_text())
+                src = data.get("_source", "")
+                for u, p in data["pages"].items():
+                    pages[u] = {**p, "fetched_at": p.get("fetched_at") or recorded_date(src),
+                                "provenance": provenance(src)}
         await asyncio.sleep(min(2.0, 0.15 * len(urls)))
         return {u: pages[u] for u in urls if u in pages}
     out = {}
@@ -157,14 +178,15 @@ async def fetch_pages(urls: list[str], domain: str, mode: str) -> dict[str, dict
             return r.json()
         results = await asyncio.gather(*[batch(urls[i:i + 10]) for i in range(0, len(urls), 10)],
                                        return_exceptions=True)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     for res in results:
         if isinstance(res, Exception):
             log.warning("TinyFish fetch batch failed: %s", res)
             continue
         for page in res.get("results", []):
-            out[page["url"]] = {"title": page.get("title", ""), "text": page.get("text", "")}
+            out[page["url"]] = {"title": page.get("title", ""), "text": page.get("text", ""), "fetched_at": now}
     _merge_record(domain, out)
-    return out
+    return {u: {**p, "provenance": provenance("TinyFish Fetch API", live=True)} for u, p in out.items()}
 
 
 def _replay_path(domain: str, name: str):

@@ -14,7 +14,7 @@ http = httpx.Client(base_url=base, trust_env=False, timeout=180)
 
 p = http.post("/api/plan", json={"objective": objective}).json()
 r = p["requirements"]
-print("planner:", p["planner"], "| domain:", r["domain"], "| qty:", r["quantity"], "| budget:", r["budget_total_usd"])
+print("planner:", p["planner"], "| domain:", r["domain"], "| qty:", r["quantity"], "| budget:", r.get("budget_total"), r.get("currency"))
 found = [v for v in p.get("discovery", {}).get("vendors", []) if v.get("recorded")]
 print("search:", p.get("discovery", {}).get("query"), "| discovered:", [v["key"] for v in p.get("discovery", {}).get("vendors", [])],
       "| dispatching:", [v["key"] for v in found])
@@ -33,7 +33,7 @@ if not m["report"]:
 print("summary:", m["report"]["summary"])
 print("verification:", m["report"]["insights"].get("verification"))
 for o in m["report"]["offers"][:6]:
-    print(f"  #{o['rank']} {o['score']:5} {o['vendor']:12} ${o['unit_price']:>8} eff ${o['effective_unit_price'] or o['unit_price']:>8} "
+    print(f"  #{o['rank']} {o['score']:5} {o['vendor']:12} ${o['unit_price']:>8} eff ${o['effective_unit_price'] or o['unit_price']:>8} landed {(o.get('landed') or {}).get('total')} "
           f"{o['verification'].get('status', '-'):10} {o['name'][:44]}")
 best = next(o for o in m["report"]["offers"] if o["id"] == m["report"]["recommended_offer_id"]) \
     if m["report"]["recommended_offer_id"] else None

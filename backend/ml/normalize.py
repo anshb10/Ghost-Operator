@@ -135,10 +135,11 @@ def normalize_offers(vendor: str, raw_result, domain_cfg: dict) -> list[Offer]:
         attrs["warranty_years"] = w.years if w.years is not None else 0.0
         attrs["warranty_onsite"] = 1.0 if w.service == "onsite" else 0.0
         url = str(p.get("product_page_url") or p.get("url") or "")
-        uid = hashlib.sha1(f"{vendor}|{name}|{p.get('price_usd')}|{p.get('storage')}|{url}".encode()).hexdigest()[:10]
+        price = p.get("price_usd") or p.get("price_inr") or p.get("price")
+        uid = hashlib.sha1(f"{vendor}|{name}|{price}|{p.get('storage')}|{url}".encode()).hexdigest()[:10]
         offers.append(Offer(
             id=uid, vendor=vendor, name=name, sku=str(p.get("sku") or ""),
-            unit_price=parse_price(p.get("price_usd") or p.get("price")),
+            unit_price=parse_price(price), currency=domain_cfg.get("currency", "USD"),
             url=url, attributes=attrs, warranty=w,
             seller=str(p.get("seller") or vendor),
             condition=parse_condition(p.get("condition"), name),

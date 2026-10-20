@@ -22,11 +22,14 @@ REPLAY_SPEED = float(os.getenv("REPLAY_SPEED", "20"))
 
 DOMAINS_DIR = ROOT / "config" / "domains"
 REPLAY_DIR = ROOT / "fixtures" / "replay"
-RECORD_DIR = ROOT / "data" / "recorded"
+# GHOST_DATA_DIR lets tests and evals run against a throwaway directory.
+DATA_DIR = Path(os.getenv("GHOST_DATA_DIR", str(ROOT / "data")))
+RECORD_DIR = DATA_DIR / "recorded"
 FRONTEND_DIR = ROOT / "frontend"
 
 
 def effective_mode() -> str:
+    """Server default. A mission may still be run in replay on a live server (see app.create_mission)."""
     if MODE == "auto":
         return "live" if TINYFISH_API_KEY else "replay"
     return MODE

@@ -1,34 +1,31 @@
-"""Run the ML layer over the recorded fixtures offline (no TinyFish / Claude calls). Usage: python -m scripts.analyze_fixtures [domain] [objective]"""
+"""Run verification + the analysis engine over the recorded fixtures offline (no TinyFish / Claude calls).
+Usage: python -m scripts.analyze_fixtures [objective]"""
 import json
 import sys
 
-from backend import config, planner
-from backend.ml import matching, normalize, pricing, warranty_risk
-from backend.scoring import apply_constraints, compute_tco, rank
+from backend import config, planner, verify
+from backend.engine import analyze
+from backend.ml import matching, normalize, pricing
+from backend.tinyfish import provenance, recorded_date
 
-domain = sys.argv[1] if len(sys.argv) > 1 else "laptops"
-objective = sys.argv[2] if len(sys.argv) > 2 else "50 business laptops, 16GB RAM, Windows 11 Pro, 3 year warranty, budget $75k"
+objective = sys.argv[1] if len(sys.argv) > 1 else "50 business laptops, 16GB RAM, Windows 11 Pro, 3 year warranty, budget $75k"
 domains = config.load_domains()
 req = planner.plan_heuristic(objective, domains)
-cfg = domains[domain]
+cfg = domains[req.domain]
 offers = []
-for v in cfg["vendors"]:
-    p = config.REPLAY_DIR / domain / f"{v['key']}.json"
-    if p.exists():
-        offers += normalize.normalize_offers(v["name"], json.loads(p.read_text())["result"], cfg)
-groups = matching.group_offers(offers)
-info = pricing.price_offers(offers, cfg["price_features"])
-for o in offers:
-    warranty_risk.score_offer(o, 3)
-apply_constraints(offers, req)
-compute_tco(offers, req, cfg["risk_model"])
-ranked = rank(offers)
-print("req:", req.quantity, req.budget_total_usd, req.max_unit_price_usd, [(c.attribute, c.op, c.value, c.hard) for c in req.constraints])
-print("price model:", info)
-print("groups:", groups)
-print("cross-vendor:", pricing.cross_vendor_deltas(ranked))
-print("families:", json.dumps(matching.family_matches(ranked), indent=0)[:1500])
-for o in ranked:
-    print(f"{o.rank!s:>4} {o.score:5} {o.vendor:7} ${o.unit_price or 0:>8,.0f} fair ${o.fair_price or 0:>7,.0f} fit {o.fit_score:.2f} "
-          f"risk {o.warranty_risk:.2f} {o.warranty.service:8} {o.attributes.get('cpu_tier')} {o.attributes.get('storage_gb')} "
-          f"| {o.name[:40]} | {o.anomaly or ''} | {o.failed_constraints}")
+for p in sorted((config.REPLAY_DIR / req.domain).glob("[!_]*.json")):
+    offers += normalize.normalize_offers(p.stem, json.loads(p.read_text())["result"], cfg)
+data = json.loads((config.REPLAY_DIR / req.domain / "_fetch.json").read_text())
+pages = {u: {**pg, "fetched_at": recorded_date(data["_source"]), "provenance": provenance(data["_source"])}
+         for u, pg in data["pages"].items()}
+print("verification:", verify.verify_with_pages(offers, pages, req.quantity))
+matching.group_offers(offers)
+print("price model:", pricing.price_offers(offers, cfg["price_features"])["method"])
+res = analyze(offers, req, cfg)
+print("req:", req.domain, req.currency, req.quantity, req.budget_total, req.deadline_days)
+for o in res["ranked"]:
+    lc = o.landed
+    print(f"{o.rank!s:>4} {o.score:5} {o.vendor[:8]:8} {o.unit_price or 0:>10,.0f} landed {lc.get('total') or 0:>12,.0f} "
+          f"{lc.get('confidence', '-'):10} risk {o.risk.get('level', '-'):9} | {o.name[:40]} | "
+          f"{[f['code'] for f in o.flags if f['severity'] in ('high', 'medium')]} {o.failed_constraints}")
+print("decision:", json.dumps(res["decision"]["why"], ensure_ascii=False, indent=1))

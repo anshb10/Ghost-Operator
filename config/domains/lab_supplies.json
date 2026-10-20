@@ -16,7 +16,7 @@
     {"attribute": "thickness_mil", "op": ">=", "value": 4, "hard": false, "weight": 1.5},
     {"attribute": "count_per_case", "op": ">=", "value": 1000, "hard": false, "weight": 1}
   ],
-  "risk_model": {"annual_failure_rate": 0.02, "repair_cost_ratio": 1.0, "lifetime_years": 1},
+  "risk_model": {"annual_failure_rate": 0.02, "repair_cost_ratio": 1.0, "lifetime_years": 1, "downtime": false},
   "goal_template": "Find {item} matching: {criteria}. For up to {n} products listed, extract JSON {{\"products\":[{{\"product_name\",\"sku\",\"price_usd\",\"count_per_case\",\"thickness_mil\",\"powder_free\",\"certifications\",\"warranty\",\"seller\",\"condition\",\"stock_status\",\"product_page_url\"}}]}}. price_usd = price per case as a number. warranty = return policy / shelf-life guarantee as shown. {hint} Do not add anything to cart, do not sign in, decline non-essential cookies.",
   "vendors": [
     {"key": "fisher", "name": "Fisher Scientific", "url": "https://www.fishersci.com/us/en/browse/90161010/exam-gloves", "hint": ""},
