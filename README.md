@@ -24,6 +24,36 @@ Objective ──► Planner (Claude) ──► editable Requirements (hard/soft 
    Recommend the best *page-verified, in-stock* offer ──► Human approve/reject ──► Draft PO
 ```
 
+## Who it's for, and why it matters
+
+**Who:** office managers, lab managers, IT leads and founders at companies of 10 to 500 people, plus schools and clinics. They buy laptops, gloves and other equipment in bulk a few times a year, and none of them has a procurement team.
+
+**The problem today:**
+- **It eats time.** In a Walmart Business survey of 500+ decision-makers at 10–500-person companies, 37% said they spend 4 to 7 hours a week on routine ordering alone ([PYMNTS](https://www.pymnts.com/?p=3882849)).
+- **Most have no tooling.** Nearly two-thirds of finance leaders in a CFO Connect survey had no dedicated procurement tool ([Spendesk](https://www.spendesk.com/blog/procurement-software-adoption/)).
+- **Each order costs money to process.** APQC puts the median cost of processing one purchase order at about $42, with a range of $14 to $54+ ([APQC](https://www.apqc.org/resource-library/resource/how-efficient-your-procurement-process-benchmarks-reveal-wide-performance)).
+- **The web is full of traps for a one-time buyer.** Promo prices are capped per order, configurators show a different spec at the advertised price, warranties turn out to be mail-in, and stock is backordered. A busy person comparing tabs misses these.
+
+**What changes with Ghost Operator.** The buyer types one sentence, and within minutes (live runs take 3 to 12 minutes; replay takes under a minute) gets a ranked shortlist in which every price was re-checked on the vendor's own page. They also get a memo that explains the trade-offs, a ready purchase order and, where needed, a drafted quote-request email.
+
+These are real catches from the recorded runs (see [What verification caught](#what-verification-caught-on-real-pages-2026-10-16)):
+
+| Trap | What a tab-by-tab buyer would have done | What Ghost Operator did |
+|---|---|---|
+| Lenovo ThinkBook 14x at **$849**, "Max 5 units per order" | Budgeted 50 × $849 = **$42,450** | Re-costed the other 45 units at list: expected **$61,975**, so a **$19,525 (46%) budget gap** was caught before approval. It ranked the offer "ask for a quote" and drafted that email. |
+| Dell Pro 16 at $1,255 advertised with 16 GB | Bought 50 machines with **8 GB** RAM | The page showed 8 GB at that price, so the offer was corrected and excluded. |
+| Uline gloves priced "per 1,000" by the agent | Ordered 10× the intended quantity, or 10× short | The page sells cartons of 100, so the offer was flagged as a mismatch. |
+| Same ThinkPad E14 at Lenovo and CDW | Picked whichever tab was open | Lenovo direct was 3% cheaper, with a better CPU and 2× the storage. |
+
+**Why it's realistic:**
+- **A human stays in charge.** Nothing is ever bought or sent automatically. The buyer can override the pick (with a reason that's recorded on the PO), tune the scoring weights and export everything to CSV.
+- **It doesn't depend on any one store.** It works on vendors' public websites, so there are no supplier integrations to sign. New categories are a JSON file in `config/domains/`.
+- **It works without a network.** Replay mode runs on recorded real TinyFish runs, so a demo never depends on the network.
+- **Known limits:**
+  - Live runs take 3 to 12 minutes.
+  - The recorded vendors are US stores.
+  - A listed price isn't a contract, which is why quotes are drafted for anything uncertain.
+
 ## How TinyFish is used
 
 TinyFish is the product's eyes and hands on the live web. All three APIs do work that the product can't do without them:
@@ -44,6 +74,51 @@ TinyFish is the product's eyes and hands on the live web. All three APIs do work
 - **Office Depot (discovered by Search):** all 4 offers verified (price, RAM, storage, warranty).
 
 Net effect: the naive cheapest pick ($849 ThinkBook) becomes "ask Lenovo for a 50-unit quote", and the recommendation goes to the best offer whose **price is confirmed on the vendor's page and that is in stock**.
+
+## Revenue model
+
+**Who pays:** the 10–500-person company, per mission (one buying objective, e.g. "50 laptops"). We sell to the buyer only. We take **no vendor commissions or paid placement**, because a ranking that can be bought is worthless to the buyer.
+
+### What one mission costs us (measured on the recorded runs)
+
+| Cost | Rate | Laptops (5 vendors) | Gloves (2 vendors) |
+|---|---|---|---|
+| TinyFish Web Agent | $0.016 / step ([pricing](https://tinyfish.ai/pricing)) | 124 steps = **$1.98** | 131 steps = **$2.10** |
+| TinyFish Search + Fetch | free on every plan ([pricing](https://tinyfish.ai/pricing)) | $0 | $0 |
+| Claude (planner + memo) | Opus 5.5 at $4 / $20 per M input/output tokens ([pricing](https://www.eesel.ai/blog/claude-opus-5-5-pricing)) | ≈ $0.20 (est.) | ≈ $0.20 (est.) |
+| **Total** | | **≈ $2.20** | **≈ $2.30** |
+
+We budget **$2.50 per mission** to cover retries and the occasional long agent run (Uline alone took 101 steps).
+
+### Pricing
+
+| Plan | Price | Included | Our cost at $2.50 / mission | Gross margin |
+|---|---|---|---|---|
+| **Free** | $0 | 2 live missions / month, unlimited replay | $5 | acquisition cost |
+| **Pay as you go** | **$19 / mission** | 1 mission + PO + quote drafts | $2.50 | **87%** |
+| **Team** | **$149 / month** | 20 missions ($7.45 each), extra at $9, shared mission history | $50 | **66%** |
+| **Business** | **$499 / month** | 80 missions, CSV export, custom categories, priority support | $200 | **60%** |
+
+These margins are a floor:
+- **Unused missions:** they cost us nothing.
+- **Batch API:** the memo can run on Anthropic's Batch API at half price.
+- **Repeat visits:** they can reuse a vendor's known navigation, which needs fewer agent steps.
+- **Volume rates:** TinyFish offers enterprise contract pricing at volume.
+
+### Why these prices are justified
+
+- **It costs less than the order it replaces.** At $19, a mission costs less than half of APQC's ~$42 median cost to process one purchase order, and it also does the sourcing and verification that the $42 doesn't include.
+- **One catch pays for a year.** The capped-promo catch above was a $19,525 budget error on one order. The 3% same-model price gap is about $2,000 on a $69,000 laptop order. Either one covers more than a year of the Team plan ($1,788).
+- **It undercuts existing tools and does something they don't.** Spend-management tools like Procurify are quote-based. Third-party listings start around $23 per user per month ([TrustRadius](https://trustradius.com/products/procurify/pricing)), with small-business deployments reported at around $1,000 per month ([ERP Research](https://erpresearch.com/erp-add-ons/procurement/procurify/pricing)). Those tools route approvals and POs for suppliers you already know. Ghost Operator does the step before that: it finds and verifies the offer on the live web. It complements them (CSV export), and Team is priced below them.
+
+### Go-to-market
+
+1. **Free tier and replay demo.** Anyone can see a full mission in under a minute with no signup.
+2. **Templates for the three most common bulk buys.** These are IT hardware, lab and medical consumables, and office supplies. Each is one `config/domains/*.json` file.
+3. **Channels that already serve these buyers.** These are IT managed-service providers, lab-supply consultants and coworking operators.
+4. **India next.** Adding Indian vendor domains (e.g. Amazon Business India, IndiaMART) is a config change, not a rewrite.
+
+**Illustrative target, not a forecast:** 500 companies on Team is $74,500 a month, or about $0.9M ARR, at a ~66% gross margin.
 
 ## Run it
 
