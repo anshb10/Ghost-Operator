@@ -622,7 +622,7 @@ function renderDecision() {
     $("#po-link").href = po;
     bar.className = "decide " + (d.decision === "approve" ? "approved" : "rejected");
     bar.innerHTML = d.decision === "approve"
-      ? `<div class="what"><small style="color:#fff">Approved${d.offer_id !== rep.recommended_offer_id ? " · buyer override" : ""}</small><span>Signed off by ${esc(d.approver || "buyer")} · ${esc(what)}</span></div><a class="btn btn-gold" target="_blank" href="${po}">Open purchase order →</a>`
+      ? `<div class="what"><small style="color:#fff">Approved${d.offer_id !== rep.recommended_offer_id ? " · buyer override" : ""}</small><span>Signed off by ${esc(d.approver || "buyer")} · ${esc(what)}</span>${d.offer_id !== rep.recommended_offer_id && d.note ? `<span class="why">Reason: ${esc(d.note)}</span>` : ""}</div><a class="btn btn-gold" target="_blank" href="${po}">Open purchase order →</a>`
       : `<div class="what"><small>Rejected</small><span>No purchase order issued.${d.note ? " " + esc(d.note) : ""}</span></div>`;
     return;
   }
@@ -634,7 +634,7 @@ function renderDecision() {
     <div class="what"><small>${override ? "Buyer override · not the recommendation" : "Ready for sign-off"}</small>
       <span>${o ? esc(`${req.quantity} × ${trunc(o.name, 60)} · ${usd(unitOf(o) * req.quantity)}`) : "Nothing to approve"}</span>
       ${override ? `<button class="btn btn-link" id="btn-unpick">Back to recommendation</button>` : ""}</div>
-    ${override ? `<input id="note" placeholder="Why this offer? (printed on the PO)" aria-label="Reason for choosing this offer" maxlength="1000">` : ""}
+    ${override ? `<input id="note" placeholder="Why this offer? Required, printed on the PO" aria-label="Reason for choosing this offer (required)" maxlength="1000" required>` : ""}
     <input id="approver" placeholder="Approver name" aria-label="Approver name" maxlength="120">
     <button id="btn-reject" class="btn btn-ghost">Reject</button>
     <button id="btn-approve" class="btn btn-gold" ${o ? "" : "disabled"}>Approve purchase</button>`;
@@ -647,14 +647,20 @@ function renderDecision() {
 
 async function decide(decision) {
   const rep = MISSION.report, override = SELECTED !== rep.recommended_offer_id, note = $("#note")?.value.trim() || "";
-  if (decision === "approve" && override && !note) { $("#note").classList.add("need"); $("#note").focus(); return; }
+  const needReason = () => {
+    const el = $("#note"); el.classList.add("need"); el.placeholder = `A reason is required (at least ${INFO.min_override_reason ?? 3} characters)`; el.focus();
+  };
+  if (decision === "approve" && override && note.length < (INFO.min_override_reason ?? 3)) { needReason(); return; }
   try {
     MISSION = await api(`/api/missions/${MISSION.id}/decision`, { method: "POST", body: JSON.stringify({
       decision, offer_id: SELECTED || null, approver: $("#approver").value, note,
       weights: WHATIF ? sliderWeights() : null,
     }) });
     renderDecision(); refreshTable(); renderWhatif(); loadHistory();
-  } catch (e) { alert("Could not record decision: " + e.message); }
+  } catch (e) {
+    if (/needs a reason/.test(e.message) && $("#note")) { needReason(); return; }  // server-side rule, same as above
+    alert("Could not record decision: " + e.message);
+  }
 }
 
 const show = (s) => $(s).classList.remove("hidden");

@@ -22,9 +22,13 @@ def render_po(mission, preview_offer_id: str | None = None) -> str:
     override = ""
     if offer_id != rep.get("recommended_offer_id"):
         rec = next((x for x in rep.get("offers", []) if x["id"] == rep.get("recommended_offer_id")), None)
-        why = escape((mission.decision or {}).get("note") or "no reason recorded")
-        override = (f"<p><b>Buyer override:</b> chosen instead of the recommended "
-                    f"{escape(rec['name']) if rec else 'offer'} ({escape(rec['vendor']) if rec else ''}). Reason: {why}</p>")
+        note = ((mission.decision or {}).get("note") or "").strip()
+        why = escape(note) if note else "<i>not yet given (required at approval)</i>"
+        rec_label = f"{escape(rec['name'])} ({escape(rec['vendor'])})" if rec else "offer"
+        override = ('<div style="border:1px solid #e7ddcc;border-left:4px solid #b0611c;background:#fcefdf;'
+                    'padding:10px 14px;margin:14px 0">'
+                    f"<b>Buyer override.</b> Chosen instead of the recommended {rec_label}."
+                    f"<br><b>Reason:</b> {why}</div>")
     specs = "".join(f"<li>{escape(str(k))}: {escape(str(v))}</li>" for k, v in o["evidence"].items()
                     if k not in ("product_name", "price_usd", "product_page_url"))
     risks = "".join(f"<li>{escape(r)}</li>" for r in o["warranty_risk_reasons"]) or "<li>None flagged</li>"

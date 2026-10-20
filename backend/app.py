@@ -41,6 +41,9 @@ class MissionIn(BaseModel):
     planner: str = "user-edited"
 
 
+MIN_OVERRIDE_REASON = 3  # characters, after trimming
+
+
 class DecisionIn(BaseModel):
     decision: Literal["approve", "reject"]
     offer_id: Optional[str] = None
@@ -58,7 +61,7 @@ def info():
     domains = config.load_domains()
     return {"mode": config.effective_mode(), "concurrency": config.TINYFISH_CONCURRENCY,
             "model": config.ANTHROPIC_MODEL,
-            "weights": WEIGHTS,
+            "weights": WEIGHTS, "min_override_reason": MIN_OVERRIDE_REASON,
             "domains": {k: {"label": d["label"], "vendors": d["vendors"]} for k, d in domains.items()}}
 
 
@@ -161,7 +164,13 @@ def decide(mid: str, body: DecisionIn):
         raise HTTPException(400, "unknown offer")
     if body.decision == "approve" and not next(o for o in m.report["offers"] if o["id"] == offer_id).get("rank"):
         raise HTTPException(400, "that offer failed a must-have requirement and can't be approved")
-    m.decision = {**body.model_dump(), "offer_id": offer_id, "at": datetime.now(timezone.utc).isoformat()}
+    note = body.note.strip()
+    override = offer_id != m.report["recommended_offer_id"]
+    if body.decision == "approve" and override and len(note) < MIN_OVERRIDE_REASON:
+        raise HTTPException(422, "approving an offer other than the recommendation needs a reason "
+                                 f"(at least {MIN_OVERRIDE_REASON} characters); it is printed on the purchase order")
+    m.decision = {**body.model_dump(), "note": note, "override": body.decision == "approve" and override,
+                  "offer_id": offer_id, "at": datetime.now(timezone.utc).isoformat()}
     if body.weights:
         m.decision["weights"] = normalize_weights(body.weights)
     m.status = "approved" if body.decision == "approve" else "rejected"

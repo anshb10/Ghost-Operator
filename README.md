@@ -62,6 +62,19 @@ Open http://localhost:8077.
 
 Without Claude credentials, the planner and memo fall back to rule-based versions, so the app always works.
 
+## Working with a decision brief
+
+| Feature | What it does |
+|---|---|
+| **Past missions** | Every saved mission is listed under the console. Click one to reopen its brief. Briefs are linkable (`/#m=<id>`). |
+| **What-if scoring** | Sliders for fit, lifetime cost, warranty risk, price sanity and source trust re-rank the offers server-side (`POST /api/missions/{id}/rerank`) using the same scorer. Nothing is saved; the weights in effect are recorded with the approval. |
+| **Approve a different offer** | "Choose this offer" on any eligible row (or in the what-if / compare views) switches the sign-off to it. An override needs a reason, which is printed on the PO. Excluded offers can't be approved. |
+| **Compare** | Tick 2 to 3 offers for a side-by-side table with the best value per row highlighted. |
+| **Export CSV** | `GET /api/missions/{id}/offers.csv`: every offer with prices, verification, TCO, scores and attributes. Formula-like cells are neutralised. |
+| **Quote request draft** | `GET /api/missions/{id}/offers/{offer_id}/quote-request` builds an RFQ email from what was found (promo caps, backorders, warranty gaps, unverified specs). Copy it or open it in your mail app; it's never sent automatically. |
+
+The PO prices the order at the *expected* unit price, so a capped promo is no longer understated.
+
 ## The AI/ML pieces (`backend/ml/`, `backend/scoring.py`)
 
 | Module | Technique | Why it matters |
