@@ -49,8 +49,24 @@ const ML_STEPS = [
   ["rank", "Rank", "Fit · lifetime cost · trust"],
 ];
 
-let INFO = null, PLAN = null, MISSION = null;
+const WEIGHT_LABELS = {
+  fit: ["Requirement fit", "Specs match what you asked for"],
+  value: ["Lifetime cost", "Cheaper to buy and own"],
+  risk: ["Warranty risk", "Safer coverage and service"],
+  anomaly: ["Price sanity", "Penalise suspicious prices"],
+  trust: ["Source trust", "Confirmed on the vendor's page"],
+};
+const BETTER = { ram_gb: "max", storage_gb: "max", cpu_tier: "max", warranty_years: "max", thickness_mil: "max" };
+const STATUS_LABEL = { awaiting_approval: "Awaiting approval", approved: "Approved", rejected: "Rejected", failed: "Failed", browsing: "Running", analyzing: "Analyzing" };
+
+let INFO = null, PLAN = null, MISSION = null, ES = null;
+let HISTORY = [], HISTORY_ALL = false;
+let SELECTED = null;  // offer id the buyer will approve (defaults to the recommendation)
+let WHATIF = null;    // /rerank result while the weight sliders are off their defaults
+const COMPARE = new Set();
 const clocks = {};
+const trunc = (s, n) => (s.length > n ? s.slice(0, n - 2) + "…" : s);
+const fmtDate = (iso) => new Date(iso).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 
 /* Company logo from the vendor's domain (favicon service); the coloured initial stays underneath as a fallback. */
 function tile(name, url = "") {
@@ -94,9 +110,20 @@ async function init() {
   $("#btn-plan").onclick = plan;
   $("#btn-run").onclick = dispatch;
   $("#btn-addc").onclick = () => { PLAN.requirements.constraints.push({ attribute: ATTRS[PLAN.requirements.domain][0], op: ">=", value: 0, hard: false, weight: 1 }); renderCons(); };
-  $("#btn-approve").onclick = () => decide("approve");
-  $("#btn-reject").onclick = () => decide("reject");
+  $("#btn-compare").onclick = openCompare;
+  $("#btn-history-all").onclick = () => { HISTORY_ALL = !HISTORY_ALL; renderHistory(); };
+  $("#history").onclick = (ev) => { const b = ev.target.closest("[data-mid]"); if (b) openMission(b.dataset.mid); };
+  document.querySelectorAll("dialog").forEach((d) => d.addEventListener("click", (ev) => {
+    if (ev.target === d || ev.target.closest("[data-close]")) d.close();  // backdrop or ✕
+  }));
+  $("#q-subject").oninput = $("#q-body").oninput = updateMailto;
+  $("#q-copy").onclick = copyQuote;
+  $("#memo-act").onclick = (ev) => { const b = ev.target.closest("[data-act=quote]"); if (b) openQuote(b.dataset.oid); };
+  renderSliders();
   setStage(1); $("#stage-label").textContent = "Ready";
+  await loadHistory();
+  const linked = location.hash.match(/^#m=([a-z0-9]+)$/i);
+  if (linked) openMission(linked[1]);
 }
 
 /* ── plan ─────────────────────────────────────────────── */
@@ -168,6 +195,7 @@ async function dispatch() {
   try {
     const { id } = await api("/api/missions", { method: "POST", body: JSON.stringify({ objective: $("#objective").value, requirements: r, vendor_keys, extra_vendors, planner: PLAN.planner }) });
     MISSION = await api(`/api/missions/${id}`);
+    history.replaceState(null, "", `#m=${id}`);
     ["#s-ml", "#s-report"].forEach(hide);
     renderAgents(); renderMlFlow(); show("#s-agents"); setStage(3);
     $("#s-agents").scrollIntoView({ behavior: REDUCED ? "auto" : "smooth" });
@@ -234,27 +262,71 @@ function shortMl(ev) {
 }
 
 function listen(id) {
-  const es = new EventSource(`/api/missions/${id}/events`);
+  ES?.close();  // only ever follow the mission on screen
+  const es = ES = new EventSource(`/api/missions/${id}/events`);
   es.onmessage = async (msg) => {
+    if (MISSION?.id !== id) { es.close(); return; }
     const ev = JSON.parse(msg.data);
     if (ev.kind === "agent" || ev.kind === "agent_step") updateAgent(ev);
     else if (ev.kind === "ml" || ev.kind === "verify") updateMl(ev);
-    else if (ev.kind === "report") { MISSION = await api(`/api/missions/${id}`); renderReport(); }
-    else if (ev.kind === "status" && ev.status === "failed") alert("Mission failed: " + ev.error);
+    else if (ev.kind === "report") { MISSION = await api(`/api/missions/${id}`); renderReport(); loadHistory(); }
+    else if (ev.kind === "status" && ev.status === "failed") { alert("Mission failed: " + ev.error); loadHistory(); }
   };
   es.addEventListener("end", () => es.close());
 }
 
+/* ── mission history ──────────────────────────────────── */
+async function loadHistory() {
+  try { HISTORY = await api("/api/missions"); } catch { HISTORY = []; }
+  renderHistory();
+}
+
+function renderHistory() {
+  if (!HISTORY.length) { hide("#s-history"); return; }
+  const n = HISTORY.length, list = HISTORY_ALL ? HISTORY : HISTORY.slice(0, 6);
+  $("#history-sub").textContent = `${n} saved · reopen any decision brief`;
+  $("#btn-history-all").textContent = HISTORY_ALL ? "Show fewer" : `Show all ${n}`;
+  $("#btn-history-all").classList.toggle("hidden", n <= 6);
+  $("#history").innerHTML = list.map((h) => `
+    <button class="card hcard ${MISSION?.id === h.id ? "current" : ""}" data-mid="${esc(h.id)}">
+      <div class="h-top">${h.pick ? tile(h.pick.vendor, h.pick.url) : tile(h.item)}
+        <div><div class="h-item">${esc(h.quantity)} × ${esc(h.item)}</div><div class="h-date">${esc(fmtDate(h.created))} · ${esc(h.mode)}</div></div>
+        <span class="hst ${esc(h.status)}">${esc(STATUS_LABEL[h.status] || h.status)}</span></div>
+      <div class="h-pick">${h.pick ? `<b>${esc(trunc(h.pick.name, 70))}</b><span>${esc(h.pick.vendor)} · ${usd(h.pick.total)}${h.approver ? ` · signed by ${esc(h.approver)}` : ""}</span>`
+        : `<span>${h.n_offers ? "No offer met every must-have" : "No report yet"}</span>`}</div>
+    </button>`).join("");
+  show("#s-history");
+}
+
+async function openMission(id) {
+  try { MISSION = await api(`/api/missions/${encodeURIComponent(id)}`); }
+  catch (e) { history.replaceState(null, "", location.pathname); alert("Could not open mission " + id); return; }
+  history.replaceState(null, "", `#m=${MISSION.id}`);
+  $("#objective").value = MISSION.objective;
+  ["#s-plan", "#s-agents", "#s-ml", "#s-report"].forEach(hide);
+  if (MISSION.report) renderReport();
+  else if (MISSION.status === "browsing" || MISSION.status === "analyzing") {
+    renderAgents(); renderMlFlow(); show("#s-agents"); setStage(3); listen(MISSION.id);
+    $("#s-agents").scrollIntoView({ behavior: REDUCED ? "auto" : "smooth" });
+  } else alert(`Mission ${MISSION.id} has no decision brief (status: ${MISSION.status}).`);
+  renderHistory();
+}
+
 /* ── decision brief ───────────────────────────────────── */
 const unitOf = (o) => o.effective_unit_price || o.unit_price;
+const offerById = (id) => MISSION.report.offers.find((o) => o.id === id);
 
 function renderReport() {
   const rep = MISSION.report, req = MISSION.requirements, offers = rep.offers;
   const best = offers.find((o) => o.id === rep.recommended_offer_id);
+  SELECTED = MISSION.decision?.offer_id || rep.recommended_offer_id;
+  WHATIF = null; COMPARE.clear();
   setStage(5); $("#stage-label").textContent = "Awaiting approval";
   $("#summary-by").textContent = rep.summary_by === "claude" ? "Memo drafted by Claude" : "Memo drafted from the ranked evidence";
   $("#memo").textContent = rep.summary;
-  $("#po-link").href = `/missions/${MISSION.id}/po`;
+  $("#csv-link").href = `/api/missions/${MISSION.id}/offers.csv`;
+  const valuePick = offers.find((o) => o.id === rep.value_pick_id);
+  $("#memo-act").innerHTML = valuePick ? `<button class="btn btn-ghost btn-sm" data-act="quote" data-oid="${esc(valuePick.id)}">Draft quote request to ${esc(valuePick.vendor)}</button>` : "";
 
   if (best) {
     const a = best.attributes || {};
@@ -282,11 +354,9 @@ function renderReport() {
         `<div class="meter"><i style="width:${checked ? Math.round(((vs.verified || 0) / checked) * 100) : 0}%;background:var(--ok)"></i></div>`],
     ].map(([c, l, v, s]) => `<div class="card kpi"><div class="l"><i style="background:${c}"></i>${l}</div><div class="v">${v}</div><div class="s">${s}</div></div>`).join("");
     document.querySelectorAll("#kpis [data-count]").forEach(countUp);
-    $("#decide-what").textContent = `${req.quantity} × ${best.name.length > 60 ? best.name.slice(0, 58) + "…" : best.name} · ${usd(unitOf(best) * req.quantity)}`;
   } else {
     $("#pick").innerHTML = `<div class="pick-label">No recommendation</div><h3>No option met every must-have.</h3><p class="notes">See the excluded offers below and loosen a requirement or add vendors.</p>`;
     $("#kpis").innerHTML = "";
-    $("#decide-what").textContent = "Nothing to approve";
   }
 
   const ins = [];
@@ -301,15 +371,29 @@ function renderReport() {
   (rep.insights.cross_vendor || []).forEach((d) => ins.push(["same", "Identical product", `${esc(d.name)}: ${usd(d.best_price)} at ${esc(d.best_vendor)} vs ${usd(d.worst_price)} at ${esc(d.worst_vendor)}.`]));
   $("#insights").innerHTML = ins.map(([k, t, b], i) => `<div class="card insight ${k}" style="animation-delay:${i * 70}ms"><span class="ii">${icon(k === "same" ? "match" : k)}</span><div><span class="k">${t}</span>${b}</div></div>`).join("");
 
-  renderTable(rep, offers);
+  resetSliders();
+  renderWhatif();
+  renderTable();
   renderDecision();
   show("#s-report");
   $("#s-report").scrollIntoView({ behavior: REDUCED ? "auto" : "smooth" });
 }
 
-function renderTable(rep, offers) {
+/* Offers in display order: the what-if ranking when the sliders are moved, else the mission's own. */
+function viewOffers() {
+  const offers = MISSION.report.offers;
+  if (!WHATIF) return offers;
+  const byId = new Map(offers.map((o) => [o.id, o]));
+  return WHATIF.offers.map((x) => ({ ...byId.get(x.id), score: x.score, rank: x.rank }));
+}
+
+function renderTable() {
+  const rep = MISSION.report, offers = viewOffers();
+  const origRank = new Map(rep.offers.map((o) => [o.id, o.rank]));
+  const valueId = WHATIF ? WHATIF.value_pick_id : rep.value_pick_id;
+  const locked = !!MISSION.decision;
   const eligible = offers.filter((o) => o.rank).length;
-  $("#offers-meta").textContent = `${offers.length} offers · ${eligible} eligible · ${offers.length - eligible} excluded`;
+  $("#offers-meta").textContent = `${offers.length} offers · ${eligible} eligible · ${offers.length - eligible} excluded${WHATIF ? " · what-if ranking" : ""}`;
   $("#price-note").textContent = rep.insights.price_model?.method
     ? `“vs fair” compares each price with a model fit on ${rep.insights.price_model.n} comparable offers (${rep.insights.price_model.method}). Lifetime cost adds expected out-of-warranty repairs and downtime. Score weighs fit, lifetime cost, warranty risk, price sanity and source trust.` : "";
   const firstExcluded = offers.findIndex((o) => !o.rank);
@@ -318,18 +402,25 @@ function renderTable(rep, offers) {
     const d = o.price_delta_pct;
     const delta = d == null ? "—" : `<span class="delta ${d <= -0.05 ? "neg" : d >= 0.05 ? "pos" : "neu"}">${d > 0 ? "+" : ""}${Math.round(d * 100)}%</span>`;
     const isBest = o.id === rep.recommended_offer_id;
+    const moved = WHATIF && o.rank && origRank.get(o.id) ? origRank.get(o.id) - o.rank : 0;
     const flags = [
       isBest ? '<span class="flag rec">Recommended</span>' : "",
-      o.id === rep.value_pick_id ? '<span class="flag quote">Ask for quote</span>' : "",
+      WHATIF && o.id === WHATIF.recommended_offer_id && !isBest ? '<span class="flag whatif">What-if pick</span>' : "",
+      o.id === SELECTED && !isBest ? `<span class="flag mine">${locked ? "Approved instead" : "Your choice"}</span>` : "",
+      o.id === valueId ? '<span class="flag quote">Ask for quote</span>' : "",
       o.price_flag ? `<span class="flag ${o.price_flag}">${o.price_flag}</span>` : "",
       o.condition !== "new" && o.condition !== "unknown" ? `<span class="flag bad">${esc(o.condition)}</span>` : "",
       /backorder|out of stock|sold out/i.test(o.stock) ? `<span class="flag warn">${esc(o.stock)}</span>` : "",
       ...o.failed_constraints.map((f) => `<span class="flag ${f.startsWith("unverified") ? "warn" : "bad"}">${esc(f)}</span>`),
     ].join("");
     const v = o.verification?.status;
-    const sep = idx === firstExcluded ? `<tr class="excluded-hd"><td colspan="9">Excluded · did not meet a must-have</td></tr>` : "";
-    return `${sep}<tr class="row ${isBest ? "best" : ""} ${o.rank ? "" : "excluded"}" style="animation-delay:${Math.min(idx, 14) * 40}ms">
-      <td class="rk">${o.rank ?? "–"}</td>
+    const sep = idx === firstExcluded ? `<tr class="excluded-hd"><td colspan="10">Excluded · did not meet a must-have</td></tr>` : "";
+    const choose = locked ? "" : o.rank
+      ? (o.id === SELECTED ? `<span class="act-note">✓ Selected for approval</span>` : `<button class="btn btn-primary btn-sm" data-act="choose" data-oid="${esc(o.id)}">Choose this offer</button>`)
+      : `<span class="act-note">Excluded offers can't be approved</span>`;
+    return `${sep}<tr class="row ${isBest ? "best" : ""} ${o.id === SELECTED && !isBest ? "mine" : ""} ${o.rank ? "" : "excluded"}" style="animation-delay:${Math.min(idx, 14) * 40}ms">
+      <td class="cmpcol"><input type="checkbox" data-cmp="${esc(o.id)}" ${COMPARE.has(o.id) ? "checked" : ""} aria-label="Compare ${esc(o.name)}"></td>
+      <td class="rk">${o.rank ?? "–"}${moved ? `<span class="mv ${moved > 0 ? "up" : "down"}">${moved > 0 ? "▲" : "▼"}${Math.abs(moved)}</span>` : ""}</td>
       <td><div class="pcell">${tile(o.vendor, o.url)}<div><a class="pname" href="${safeUrl(o.url)}" target="_blank" rel="noopener noreferrer">${esc(o.name)}</a>
         <div class="pvendor">${esc(o.vendor)}${o.sku ? " · " + esc(o.sku) : ""}</div><div class="flags">${flags}</div></div></div></td>
       <td class="num">${usd(o.unit_price, 2)}${o.effective_unit_price ? `<div class="eff">≈ ${usd(o.effective_unit_price)} avg (capped promo)</div>` : ""}
@@ -340,14 +431,34 @@ function renderTable(rep, offers) {
       <td class="num">${usd(o.tco)}</td>
       <td class="num"><span class="score">${o.rank ? Math.round(o.score) : "–"}</span></td>
       <td><button class="btn btn-link" data-id="${esc(o.id)}">Why</button></td></tr>
-      <tr class="details hidden" id="d-${esc(o.id)}"><td colspan="9"><div class="cols"><div>
+      <tr class="details hidden" id="d-${esc(o.id)}"><td colspan="10">
+        <div class="row-acts">${choose}${o.unit_price ? `<button class="btn btn-ghost btn-sm" data-act="quote" data-oid="${esc(o.id)}">Draft quote request</button>` : ""}</div>
+        <div class="cols"><div>
         ${verifyHtml(o)}
         <h5>Warranty risk</h5><ul>${o.warranty_risk_reasons.map((r) => `<li>${esc(r)}</li>`).join("") || "<li>None flagged</li>"}</ul>
         ${o.anomaly ? `<h5>Price check</h5><ul><li>${esc(o.anomaly)}</li></ul>` : ""}
         <h5>Lifetime cost</h5><ul>${Object.entries(o.tco_breakdown).map(([k, val]) => `<li>${esc(k.replace(/_/g, " "))}: ${usd(val)}</li>`).join("")}</ul>
       </div><div><h5>Evidence from the agent</h5><pre>${esc(JSON.stringify(o.evidence, null, 1))}</pre></div></div></td></tr>`;
   }).join("");
-  $("#offers").onclick = (ev) => { const id = ev.target.dataset.id; if (id) $(`#d-${CSS.escape(id)}`).classList.toggle("hidden"); };
+  $("#offers").onclick = (ev) => {
+    const b = ev.target.closest("button"); if (!b) return;
+    if (b.dataset.id) $(`#d-${CSS.escape(b.dataset.id)}`).classList.toggle("hidden");
+    else if (b.dataset.act === "choose") choose(b.dataset.oid);
+    else if (b.dataset.act === "quote") openQuote(b.dataset.oid);
+  };
+  $("#offers").onchange = (ev) => {
+    const id = ev.target.dataset.cmp; if (!id) return;
+    if (ev.target.checked) COMPARE.add(id); else COMPARE.delete(id);
+    updateCompareUi();
+  };
+  updateCompareUi();
+}
+
+/* Re-render the table but keep any open "Why" panels open. */
+function refreshTable() {
+  const open = [...document.querySelectorAll("#offers tr.details:not(.hidden)")].map((tr) => tr.id);
+  renderTable();
+  open.forEach((id) => document.getElementById(id)?.classList.remove("hidden"));
 }
 
 function verifyHtml(o) {
@@ -365,20 +476,184 @@ function verifyHtml(o) {
     ${fixes ? `<h5>Corrections applied</h5><ul>${fixes}</ul>` : ""}`;
 }
 
+/* ── what-if weights ──────────────────────────────────── */
+let whatifTimer = null, whatifSeq = 0;
+const sliderWeights = () => Object.fromEntries([...document.querySelectorAll("#sliders [data-w]")].map((i) => [i.dataset.w, +i.value]));
+const isDefaultWeights = (w) => Object.entries(INFO.weights).every(([k, d]) => Math.abs(w[k] - d * 100) < 0.5);
+
+function renderSliders() {
+  $("#sliders").innerHTML = Object.entries(WEIGHT_LABELS).map(([k, [l, h]]) => `
+    <label class="slider"><span class="sl-top"><b>${l}</b><output id="w-${k}"></output></span>
+      <input type="range" min="0" max="100" step="5" data-w="${k}" aria-label="${l} weight"><small>${h}</small></label>`).join("")
+    + `<button class="btn btn-link" id="btn-wreset">Reset</button>`;
+  $("#sliders").oninput = (ev) => {
+    if (!ev.target.dataset.w) return;
+    showWeightShares(); clearTimeout(whatifTimer); whatifTimer = setTimeout(runWhatif, 150);
+  };
+  $("#btn-wreset").onclick = () => { resetSliders(); runWhatif(); };
+  resetSliders();
+}
+
+function resetSliders() {
+  document.querySelectorAll("#sliders [data-w]").forEach((i) => { i.value = Math.round(INFO.weights[i.dataset.w] * 100); });
+  showWeightShares();
+}
+
+function showWeightShares() {
+  const w = sliderWeights(), total = Object.values(w).reduce((a, b) => a + b, 0) || 1;
+  Object.entries(w).forEach(([k, v]) => { $(`#w-${k}`).textContent = `${Math.round((v / total) * 100)}%`; });
+  $("#btn-wreset").classList.toggle("hidden", isDefaultWeights(w));
+}
+
+async function runWhatif() {
+  const w = sliderWeights(), seq = ++whatifSeq;
+  if (isDefaultWeights(w) || !Object.values(w).some(Boolean)) WHATIF = null;
+  else {
+    try {
+      const res = await api(`/api/missions/${MISSION.id}/rerank`, { method: "POST", body: JSON.stringify({ weights: w }) });
+      if (seq !== whatifSeq) return;  // a newer slider move already landed
+      WHATIF = res;
+    } catch (e) { $("#whatif-out").textContent = "Couldn't re-rank: " + e.message; return; }
+  }
+  renderWhatif(); refreshTable();
+}
+
+function renderWhatif() {
+  const rep = MISSION.report, out = $("#whatif-out");
+  if (!WHATIF) { out.innerHTML = `<span class="muted">Default weights. These produced the recommendation above.</span>`; return; }
+  const orig = new Map(rep.offers.map((o) => [o.id, o.rank]));
+  const moved = WHATIF.offers.filter((x) => x.rank && x.rank !== orig.get(x.id)).length;
+  const pick = WHATIF.recommended_offer_id && offerById(WHATIF.recommended_offer_id);
+  const q = MISSION.requirements.quantity;
+  if (!pick) { out.innerHTML = "No eligible offer under these weights."; return; }
+  const same = pick.id === rep.recommended_offer_id;
+  const btn = !MISSION.decision && pick.id !== SELECTED ? ` <button class="btn btn-primary btn-sm" data-act="choose" data-oid="${esc(pick.id)}">Choose this offer</button>` : "";
+  out.innerHTML = (same
+    ? `<b>Recommendation unchanged.</b> ${esc(trunc(pick.name, 60))} from ${esc(pick.vendor)} still leads the page-verified, in-stock offers.`
+    : `<span class="flag whatif">What-if pick</span> <b>${esc(trunc(pick.name, 60))}</b> from ${esc(pick.vendor)} at ${usd(unitOf(pick))}/unit (${usd(unitOf(pick) * q)} for ${q}).${btn}`)
+    + ` <span class="muted">${moved} offer${moved === 1 ? "" : "s"} changed rank.</span>`;
+  out.onclick = (ev) => { const b = ev.target.closest("[data-act=choose]"); if (b) choose(b.dataset.oid); };
+}
+
+/* ── compare ──────────────────────────────────────────── */
+function updateCompareUi() {
+  const n = COMPARE.size, b = $("#btn-compare");
+  b.disabled = n < 2;
+  b.textContent = n ? `Compare ${n}` : "Compare";
+  b.title = n < 2 ? "Tick 2 or 3 offers in the table" : "";
+  document.querySelectorAll("#offers [data-cmp]").forEach((i) => { i.disabled = !i.checked && n >= 3; });
+}
+
+function openCompare() {
+  const q = MISSION.requirements.quantity, rep = MISSION.report;
+  const list = viewOffers().filter((o) => COMPARE.has(o.id));
+  const attrs = [...new Set(list.flatMap((o) => Object.keys(o.attributes || {})))].filter((a) => a !== "warranty_onsite");
+  const pct = (x) => (x == null ? "—" : Math.round(x * 100) + "%");
+  // [label, render, numeric value for "best" highlighting, which direction wins]
+  const rows = [
+    ["Rank · score", (o) => (o.rank ? `#${o.rank} · ${Math.round(o.score)}` : "Excluded"), (o) => (o.rank ? o.score : null), "max"],
+    ["Unit price", (o) => usd(o.unit_price, 2), (o) => o.unit_price, "min"],
+    [`Expected avg for ${q}`, (o) => usd(unitOf(o)) + (o.effective_unit_price ? ' <span class="muted">capped promo</span>' : ""), unitOf, "min"],
+    [`Total for ${q}`, (o) => usd(unitOf(o) * q), (o) => unitOf(o) && unitOf(o) * q, "min"],
+    ["Lifetime cost", (o) => usd(o.tco), (o) => o.tco, "min"],
+    ["vs fair price", (o) => (o.price_delta_pct == null ? "—" : `${o.price_delta_pct > 0 ? "+" : ""}${Math.round(o.price_delta_pct * 100)}%`), (o) => o.price_delta_pct, "min"],
+    ["Requirement fit", (o) => pct(o.fit_score), (o) => o.fit_score, "max"],
+    ["Warranty", (o) => esc(o.warranty.raw || "not stated")],
+    ["Warranty risk", (o) => pct(o.warranty_risk), (o) => o.warranty_risk, "min"],
+    ["Verified on page", (o) => esc(VSTATUS[o.verification?.status]?.[0] || "—")],
+    ["Stock", (o) => esc(o.stock || "—")],
+    ["Seller · condition", (o) => esc(`${o.seller || o.vendor} · ${o.condition}`)],
+    ...attrs.map((a) => [LABELS[a] || a, (o) => esc(o.attributes[a] ?? "—"),
+      BETTER[a] ? (o) => (typeof o.attributes[a] === "number" ? o.attributes[a] : null) : null, BETTER[a]]),
+    ["Failed must-haves", (o) => (o.failed_constraints.length ? o.failed_constraints.map(esc).join("<br>") : "None")],
+  ];
+  const head = `<tr><th></th>${list.map((o) => `<th><div class="pcell">${tile(o.vendor, o.url)}<div>
+    <a class="pname" href="${safeUrl(o.url)}" target="_blank" rel="noopener noreferrer">${esc(o.name)}</a>
+    <div class="pvendor">${esc(o.vendor)}${o.id === rep.recommended_offer_id ? ' · <span class="flag rec">Recommended</span>' : ""}</div></div></div></th>`).join("")}</tr>`;
+  const body = rows.map(([label, render, val, dir]) => {
+    const nums = val ? list.map(val) : [];
+    const valid = nums.filter((x) => x != null && isFinite(x));
+    const win = valid.length >= 2 && new Set(valid).size > 1 ? (dir === "max" ? Math.max(...valid) : Math.min(...valid)) : null;
+    return `<tr><th scope="row">${esc(label)}</th>${list.map((o, i) => `<td class="${win != null && nums[i] === win ? "top" : ""}">${render(o)}</td>`).join("")}</tr>`;
+  }).join("");
+  const acts = MISSION.decision ? "" : `<tr><th></th>${list.map((o) => `<td>${o.rank && o.id !== SELECTED
+    ? `<button class="btn btn-primary btn-sm" data-act="choose" data-oid="${esc(o.id)}">Choose this offer</button>`
+    : o.id === SELECTED ? '<span class="act-note">✓ Selected</span>' : ""}</td>`).join("")}</tr>`;
+  $("#cmp-body").innerHTML = `<table class="cmp"><thead>${head}</thead><tbody>${body}${acts}</tbody></table><p class="hint">Green marks the best value in each row.</p>`;
+  $("#cmp-body").onclick = (ev) => { const b = ev.target.closest("[data-act=choose]"); if (b) { choose(b.dataset.oid); $("#dlg-compare").close(); } };
+  $("#dlg-compare").showModal();
+}
+
+/* ── quote request draft ──────────────────────────────── */
+async function openQuote(offerId) {
+  try {
+    const q = await api(`/api/missions/${MISSION.id}/offers/${encodeURIComponent(offerId)}/quote-request`);
+    $("#q-title").textContent = `Quote request · ${q.vendor}`;
+    $("#q-subject").value = q.subject; $("#q-body").value = q.body;
+    $("#q-copy").textContent = "Copy message";
+    updateMailto();
+    $("#dlg-quote").showModal();
+  } catch (e) { alert("Could not draft the quote request: " + e.message); }
+}
+
+function updateMailto() {
+  $("#q-mail").href = `mailto:?subject=${encodeURIComponent($("#q-subject").value)}&body=${encodeURIComponent($("#q-body").value)}`;
+}
+
+async function copyQuote() {
+  const text = `Subject: ${$("#q-subject").value}\n\n${$("#q-body").value}`;
+  try { await navigator.clipboard.writeText(text); $("#q-copy").textContent = "Copied ✓"; }
+  catch { $("#q-body").select(); $("#q-copy").textContent = "Press ⌘C to copy"; }
+}
+
+/* ── sign-off ─────────────────────────────────────────── */
+function choose(id) {
+  if (MISSION.decision || !offerById(id)?.rank) return;
+  SELECTED = id;
+  refreshTable(); renderWhatif(); renderDecision();
+}
+
 function renderDecision() {
-  const d = MISSION.decision, bar = $("#decision");
-  if (!d) { bar.className = "decide"; return; }
-  setStage(6);
-  bar.className = "decide " + (d.decision === "approve" ? "approved" : "rejected");
-  bar.innerHTML = d.decision === "approve"
-    ? `<div class="what"><small style="color:#fff">Approved</small><span>Signed off by ${esc(d.approver || "buyer")}</span></div><a class="btn btn-gold" target="_blank" href="/missions/${MISSION.id}/po">Open purchase order →</a>`
-    : `<div class="what"><small>Rejected</small><span>No purchase order issued.</span></div>`;
+  const d = MISSION.decision, bar = $("#decision"), rep = MISSION.report, req = MISSION.requirements;
+  const po = `/missions/${MISSION.id}/po`;
+  if (d) {
+    setStage(6);
+    const o = offerById(d.offer_id), what = o ? `${req.quantity} × ${trunc(o.name, 56)} · ${usd(unitOf(o) * req.quantity)}` : "";
+    $("#po-link").href = po;
+    bar.className = "decide " + (d.decision === "approve" ? "approved" : "rejected");
+    bar.innerHTML = d.decision === "approve"
+      ? `<div class="what"><small style="color:#fff">Approved${d.offer_id !== rep.recommended_offer_id ? " · buyer override" : ""}</small><span>Signed off by ${esc(d.approver || "buyer")} · ${esc(what)}</span></div><a class="btn btn-gold" target="_blank" href="${po}">Open purchase order →</a>`
+      : `<div class="what"><small>Rejected</small><span>No purchase order issued.${d.note ? " " + esc(d.note) : ""}</span></div>`;
+    return;
+  }
+  const o = SELECTED && offerById(SELECTED), override = !!o && SELECTED !== rep.recommended_offer_id;
+  const approver = $("#approver")?.value || "", note = $("#note")?.value || "";
+  $("#po-link").href = po + (override ? `?offer=${encodeURIComponent(SELECTED)}` : "");
+  bar.className = "decide" + (override ? " override" : "");
+  bar.innerHTML = `
+    <div class="what"><small>${override ? "Buyer override · not the recommendation" : "Ready for sign-off"}</small>
+      <span>${o ? esc(`${req.quantity} × ${trunc(o.name, 60)} · ${usd(unitOf(o) * req.quantity)}`) : "Nothing to approve"}</span>
+      ${override ? `<button class="btn btn-link" id="btn-unpick">Back to recommendation</button>` : ""}</div>
+    ${override ? `<input id="note" placeholder="Why this offer? (printed on the PO)" aria-label="Reason for choosing this offer" maxlength="1000">` : ""}
+    <input id="approver" placeholder="Approver name" aria-label="Approver name" maxlength="120">
+    <button id="btn-reject" class="btn btn-ghost">Reject</button>
+    <button id="btn-approve" class="btn btn-gold" ${o ? "" : "disabled"}>Approve purchase</button>`;
+  $("#approver").value = approver;
+  if ($("#note")) { $("#note").value = note; $("#note").oninput = () => $("#note").classList.remove("need"); }
+  $("#btn-approve").onclick = () => decide("approve");
+  $("#btn-reject").onclick = () => decide("reject");
+  $("#btn-unpick")?.addEventListener("click", () => choose(rep.recommended_offer_id));
 }
 
 async function decide(decision) {
+  const rep = MISSION.report, override = SELECTED !== rep.recommended_offer_id, note = $("#note")?.value.trim() || "";
+  if (decision === "approve" && override && !note) { $("#note").classList.add("need"); $("#note").focus(); return; }
   try {
-    MISSION = await api(`/api/missions/${MISSION.id}/decision`, { method: "POST", body: JSON.stringify({ decision, approver: $("#approver").value }) });
-    renderDecision();
+    MISSION = await api(`/api/missions/${MISSION.id}/decision`, { method: "POST", body: JSON.stringify({
+      decision, offer_id: SELECTED || null, approver: $("#approver").value, note,
+      weights: WHATIF ? sliderWeights() : null,
+    }) });
+    renderDecision(); refreshTable(); renderWhatif(); loadHistory();
   } catch (e) { alert("Could not record decision: " + e.message); }
 }
 

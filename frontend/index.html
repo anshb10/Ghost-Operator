@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="styles.css?v=6">
+<link rel="stylesheet" href="styles.css?v=7">
 </head>
 <body>
 <header class="topbar">
@@ -50,6 +50,13 @@
         <li><span class="pd"><b>05</b></span><div><div class="pt">Decide</div><div class="ps">ML ranking, you approve</div></div><span class="pa">ML + you</span></li>
       </ol>
     </aside>
+  </section>
+
+  <!-- history -->
+  <section class="section hidden" id="s-history">
+    <div class="section-hd"><h2>Past missions</h2><span class="sub" id="history-sub"></span>
+      <button id="btn-history-all" class="btn btn-link right"></button></div>
+    <div class="history" id="history"></div>
   </section>
 
   <!-- plan -->
@@ -101,26 +108,43 @@
       <div class="card pick" id="pick"></div>
       <div class="kpis" id="kpis"></div>
     </div>
-    <div class="card memo"><div class="memo-hd"><span class="eyebrow">Recommendation memo</span></div><p id="memo"></p></div>
+    <div class="card memo"><div class="memo-hd"><span class="eyebrow">Recommendation memo</span></div><p id="memo"></p><div class="memo-act" id="memo-act"></div></div>
     <div id="insights" class="insights"></div>
+    <div class="card whatif">
+      <div class="card-hd"><h3>What-if scoring</h3><span class="meta">Drag the weights to see how the ranking changes. Nothing is saved unless you approve.</span></div>
+      <div class="card-bd">
+        <div class="sliders" id="sliders"></div>
+        <div class="whatif-out" id="whatif-out"></div>
+      </div>
+    </div>
     <div class="card tablecard">
-      <div class="card-hd"><h3>All offers</h3><span class="meta" id="offers-meta"></span></div>
+      <div class="card-hd"><div><h3>All offers</h3><span class="meta" id="offers-meta"></span></div>
+        <div class="tools"><button id="btn-compare" class="btn btn-ghost btn-sm" disabled>Compare</button>
+          <a id="csv-link" class="btn btn-ghost btn-sm" download>Export CSV</a></div></div>
       <div class="tablewrap"><table class="offers"><thead><tr>
-        <th>#</th><th>Product</th><th class="num">Unit price</th><th class="num">vs fair</th><th>Fit</th>
+        <th class="cmpcol" title="Tick up to 3 offers to compare"><span class="sr">Compare</span></th><th>#</th><th>Product</th><th class="num">Unit price</th><th class="num">vs fair</th><th>Fit</th>
         <th>Warranty · risk</th><th class="num">Lifetime cost</th><th class="num">Score</th><th></th></tr></thead>
         <tbody id="offers"></tbody></table></div>
       <div class="foot-note" id="price-note"></div>
     </div>
-    <div class="decide" id="decision">
-      <div class="what"><small>Ready for sign-off</small><span id="decide-what"></span></div>
-      <input id="approver" placeholder="Approver name" aria-label="Approver name">
-      <button id="btn-reject" class="btn btn-ghost">Reject</button>
-      <button id="btn-approve" class="btn btn-gold">Approve purchase</button>
-    </div>
+    <div class="decide" id="decision"></div>
     <p class="hint">Nothing is ordered or sent. Approving only finalizes the purchase-order document.</p>
   </section>
+  <dialog id="dlg-compare" class="dlg wide" aria-labelledby="cmp-title">
+    <div class="dlg-hd"><h3 id="cmp-title">Side-by-side comparison</h3><button class="x" data-close aria-label="Close">✕</button></div>
+    <div class="dlg-bd"><div class="tablewrap" id="cmp-body"></div></div>
+  </dialog>
+  <dialog id="dlg-quote" class="dlg" aria-labelledby="q-title">
+    <div class="dlg-hd"><h3 id="q-title">Quote request</h3><button class="x" data-close aria-label="Close">✕</button></div>
+    <div class="dlg-bd">
+      <label class="field">Subject<input id="q-subject"></label>
+      <label class="field" style="margin-top:12px">Message<textarea id="q-body" rows="16"></textarea></label>
+      <p class="hint">Draft only. Ghost Operator never sends it. Copy it into your mail client and add the vendor's address.</p>
+    </div>
+    <div class="dlg-ft"><a id="q-mail" class="btn btn-ghost">Open in mail app</a><button id="q-copy" class="btn btn-primary">Copy message</button></div>
+  </dialog>
 </main>
 <footer><span>Ghost Operator · web agents, search and fetch by TinyFish</span><span>Prices are captured live from vendor sites and may change.</span></footer>
-<script src="app.js?v=6"></script>
+<script src="app.js?v=7"></script>
 </body>
 </html>

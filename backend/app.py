@@ -58,6 +58,7 @@ def info():
     domains = config.load_domains()
     return {"mode": config.effective_mode(), "concurrency": config.TINYFISH_CONCURRENCY,
             "model": config.ANTHROPIC_MODEL,
+            "weights": WEIGHTS,
             "domains": {k: {"label": d["label"], "vendors": d["vendors"]} for k, d in domains.items()}}
 
 
